@@ -21,7 +21,7 @@ GA(Generally Available) yet, please contact your TAM(Technical Account Manager)
 if you want to use these Rapid Storage APIs.
 
 """
-from typing import Optional
+from typing import List, Optional, Tuple
 from google.cloud import _storage_v2
 from google.cloud.storage._experimental.asyncio.async_grpc_client import AsyncGrpcClient
 from google.cloud.storage._experimental.asyncio.async_abstract_object_stream import (
@@ -91,12 +91,14 @@ class _AsyncWriteObjectStream(_AsyncAbstractObjectStream):
         self.persisted_size = 0
         self.object_resource: Optional[_storage_v2.Object] = None
 
-    async def open(self) -> None:
+    async def open(self, metadata: Optional[List[Tuple[str, str]]] = None) -> None:
         """Opening an object for write , should do it's state lookup
         to know what's the persisted size is.
         """
         if self._is_stream_open:
             raise ValueError("Stream is already open")
+
+        write_handle = self.write_handle if self.write_handle else None
 
         # Create a new object or overwrite existing one if generation_number
         # is None. This makes it consistent with GCS JSON API behavior.
@@ -116,15 +118,31 @@ class _AsyncWriteObjectStream(_AsyncAbstractObjectStream):
                     bucket=self._full_bucket_name,
                     object=self.object_name,
                     generation=self.generation_number,
+                    write_handle=write_handle,
                 ),
             )
 
+        request_params = [f"bucket={self._full_bucket_name}"]
+        other_metadata = []
+        if metadata:
+            for key, value in metadata:
+                if key == "x-goog-request-params":
+                    request_params.append(value)
+                else:
+                    other_metadata.append((key, value))
+
+        current_metadata = other_metadata
+        current_metadata.append(("x-goog-request-params", ",".join(request_params)))
+
+        print("Before sending first_bidi_write_req in open:", self.first_bidi_write_req)
+
         self.socket_like_rpc = AsyncBidiRpc(
-            self.rpc, initial_request=self.first_bidi_write_req, metadata=self.metadata
+            self.rpc, initial_request=self.first_bidi_write_req, metadata=current_metadata
         )
 
         await self.socket_like_rpc.open()  # this is actually 1 send
         response = await self.socket_like_rpc.recv()
+        print("Received response on open")
         self._is_stream_open = True
 
         if not response.resource:
@@ -181,7 +199,16 @@ class _AsyncWriteObjectStream(_AsyncAbstractObjectStream):
         """
         if not self._is_stream_open:
             raise ValueError("Stream is not open")
-        return await self.socket_like_rpc.recv()
+        response = await self.socket_like_rpc.recv()
+        # Update write_handle if present in response
+        if response:
+            if response.write_handle:
+                self.write_handle = response.write_handle
+            if response.persisted_size is not None:
+                self.persisted_size = response.persisted_size
+            if response.resource and response.resource.size:
+                self.persisted_size = response.resource.size
+        return response
 
     @property
     def is_stream_open(self) -> bool:
